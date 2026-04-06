@@ -1,0 +1,118 @@
+name: Build release and generate patch
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-patch:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install GitHub CLI
+        run: |
+          gh --version
+
+      - name: Read release tag
+        id: current
+        run: |
+          echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------------
+      # À ADAPTER :
+      # Cette étape doit produire TON zip complet de release.
+      # Le résultat attendu est: dist/release-full.zip
+      # ------------------------------------------------------------------
+      - name: Build full release zip
+        run: |
+          mkdir -p dist
+          # Exemple :
+          # ./build.sh
+          # cp path/to/your/generated/release.zip dist/release-full.zip
+
+          echo "Remplace cette étape par ton vrai process de build"
+          exit 1
+
+      - name: Upload full zip to current release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ steps.current.outputs.tag }}" \
+            dist/release-full.zip#release-full.zip \
+            --clobber
+
+      - name: Find previous release tag
+        id: previous
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import json, os, subprocess, sys
+
+          current_tag = os.environ["CURRENT_TAG"]
+
+          data = subprocess.check_output(
+              ["gh", "release", "list", "--limit", "100", "--json", "tagName,isDraft,isPrerelease,publishedAt"],
+              text=True
+          )
+          releases = json.loads(data)
+
+          releases = [
+              r for r in releases
+              if not r.get("isDraft") and not r.get("isPrerelease")
+          ]
+
+          tags = [r["tagName"] for r in releases]
+
+          if current_tag not in tags:
+              print("previous_tag=", file=open(os.environ["GITHUB_OUTPUT"], "a"))
+              sys.exit(0)
+
+          idx = tags.index(current_tag)
+          prev = tags[idx + 1] if idx + 1 < len(tags) else ""
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"previous_tag={prev}\n")
+          PY
+        env:
+          CURRENT_TAG: ${{ steps.current.outputs.tag }}
+
+      - name: Download previous full zip
+        if: steps.previous.outputs.previous_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p previous
+          gh release download "${{ steps.previous.outputs.previous_tag }}" \
+            --pattern "release-full.zip" \
+            --dir previous
+
+      - name: Generate patch
+        if: steps.previous.outputs.previous_tag != ''
+        run: |
+          python .github/scripts/generate_patch.py \
+            --old-zip previous/release-full.zip \
+            --new-zip dist/release-full.zip \
+            --from-version "${{ steps.previous.outputs.previous_tag }}" \
+            --to-version "${{ steps.current.outputs.tag }}" \
+            --output dist/patch.zip
+
+      - name: Upload patch zip
+        if: steps.previous.outputs.previous_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ steps.current.outputs.tag }}" \
+            dist/patch.zip#patch-${{ steps.previous.outputs.previous_tag }}-to-${{ steps.current.outputs.tag }}.zip \
+            --clobber
