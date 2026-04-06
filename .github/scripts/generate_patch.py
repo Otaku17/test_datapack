@@ -4,8 +4,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
-import shutil
 import stat
 import tempfile
 import zipfile
@@ -26,31 +24,22 @@ def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
 def safe_extract(zip_path: Path, dest: Path) -> None:
     with zipfile.ZipFile(zip_path, "r") as zf:
         for member in zf.infolist():
-            member_path = dest / member.filename
-            resolved = member_path.resolve()
-            if not str(resolved).startswith(str(dest.resolve())):
+            target = (dest / member.filename).resolve()
+            if not str(target).startswith(str(dest.resolve())):
                 raise RuntimeError(f"Unsafe path in zip: {member.filename}")
         zf.extractall(dest)
 
 
 def list_files(root: Path) -> dict[str, Path]:
-    files: dict[str, Path] = {}
+    result: dict[str, Path] = {}
     for path in root.rglob("*"):
         if path.is_file():
-            rel = path.relative_to(root).as_posix()
-            files[rel] = path
-    return files
+            result[path.relative_to(root).as_posix()] = path
+    return result
 
 
-def is_probably_executable(path: Path) -> bool:
-    suffix = path.suffix.lower()
-    return suffix in {".exe", ".dll", ".so", ".dylib", ".sh", ".bat", ".cmd"}
-
-
-def normalize_permissions(src: Path, zi: zipfile.ZipInfo) -> zipfile.ZipInfo:
-    mode = stat.S_IFREG | (0o755 if is_probably_executable(src) else 0o644)
-    zi.external_attr = mode << 16
-    return zi
+def is_executable(path: Path) -> bool:
+    return path.suffix.lower() in {".exe", ".dll", ".so", ".dylib", ".sh", ".bat", ".cmd"}
 
 
 def build_patch(old_dir: Path, new_dir: Path, output_zip: Path, from_version: str, to_version: str) -> None:
@@ -65,9 +54,8 @@ def build_patch(old_dir: Path, new_dir: Path, output_zip: Path, from_version: st
         old_path = old_files.get(rel)
         if old_path is None:
             added.append(rel)
-        else:
-            if sha256_file(old_path) != sha256_file(new_path):
-                modified.append(rel)
+        elif sha256_file(old_path) != sha256_file(new_path):
+            modified.append(rel)
 
     for rel in old_files:
         if rel not in new_files:
@@ -92,41 +80,46 @@ def build_patch(old_dir: Path, new_dir: Path, output_zip: Path, from_version: st
         for rel in sorted(added + modified):
             src = new_files[rel]
             arcname = f"files/{rel}"
-            zi = zipfile.ZipInfo.from_file(src, arcname=arcname)
-            zi = normalize_permissions(src, zi)
-            with src.open("rb") as f:
-                zf.writestr(zi, f.read())
 
-        manifest_bytes = json.dumps(manifest, indent=2, ensure_ascii=False).encode("utf-8")
-        zi = zipfile.ZipInfo("manifest.json")
-        zi.external_attr = (stat.S_IFREG | 0o644) << 16
-        zf.writestr(zi, manifest_bytes)
+            info = zipfile.ZipInfo.from_file(src, arcname=arcname)
+            mode = stat.S_IFREG | (0o755 if is_executable(src) else 0o644)
+            info.external_attr = mode << 16
+
+            with src.open("rb") as f:
+                zf.writestr(info, f.read())
+
+        manifest_info = zipfile.ZipInfo("manifest.json")
+        manifest_info.external_attr = (stat.S_IFREG | 0o644) << 16
+        zf.writestr(
+            manifest_info,
+            json.dumps(manifest, indent=2, ensure_ascii=False).encode("utf-8")
+        )
 
     print(json.dumps(manifest, indent=2, ensure_ascii=False))
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate file-based patch zip from two release zips.")
-    parser.add_argument("--old-zip", required=True, help="Path to previous full release zip")
-    parser.add_argument("--new-zip", required=True, help="Path to current full release zip")
-    parser.add_argument("--from-version", required=True, help="Previous version/tag")
-    parser.add_argument("--to-version", required=True, help="Current version/tag")
-    parser.add_argument("--output", required=True, help="Output patch zip path")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--old-zip", required=True)
+    parser.add_argument("--new-zip", required=True)
+    parser.add_argument("--from-version", required=True)
+    parser.add_argument("--to-version", required=True)
+    parser.add_argument("--output", required=True)
     args = parser.parse_args()
 
     old_zip = Path(args.old_zip).resolve()
     new_zip = Path(args.new_zip).resolve()
     output_zip = Path(args.output).resolve()
 
-    if not old_zip.is_file():
-        raise FileNotFoundError(f"Missing old zip: {old_zip}")
-    if not new_zip.is_file():
-        raise FileNotFoundError(f"Missing new zip: {new_zip}")
+    if not old_zip.exists():
+        raise FileNotFoundError(f"Old zip not found: {old_zip}")
+    if not new_zip.exists():
+        raise FileNotFoundError(f"New zip not found: {new_zip}")
 
     with tempfile.TemporaryDirectory(prefix="patchgen-") as tmp:
-        tmp_root = Path(tmp)
-        old_dir = tmp_root / "old"
-        new_dir = tmp_root / "new"
+        tmp_dir = Path(tmp)
+        old_dir = tmp_dir / "old"
+        new_dir = tmp_dir / "new"
         old_dir.mkdir(parents=True, exist_ok=True)
         new_dir.mkdir(parents=True, exist_ok=True)
 
